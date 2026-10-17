@@ -6,8 +6,8 @@
     "api_key_env": "AGNES_API_KEY",
     "temperature": 0.3,
     "max_tokens": 4096,
-    "throttle_sec": 0.4,
-    "analysis_concurrency": 2,
+    "throttle_sec": 0.5,
+    "analysis_concurrency": 1,
     "enrichment_concurrency": 1,
     "languages": ["zh", "en"]
   },
@@ -29,7 +29,7 @@
       "enabled": true,
       "query": "gold OR silver OR Fed OR crude oil OR Apple foldable OR OpenAI",
       "mode": "ArtList",
-      "max_records": 20,
+      "max_records": 12,
       "timespan": "24h",
       "category": "finance",
       "profile": "finance-news"
@@ -39,7 +39,7 @@
       "query": "黄金 OR 白银 OR 美联储 OR 原油 OR 苹果 OR 美股 OR 科技",
       "language": "zh",
       "country": "CN",
-      "max_results": 40,
+      "max_results": 24,
       "category": "finance",
       "profile": "finance-news"
     }
