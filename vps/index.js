@@ -322,6 +322,7 @@ async function answerNews(from, topic) {
 }
 
 const DAILY_TOPICS = ['黄金', '白银', '原油', '美联储', 'A股', '苹果', '科技'];
+const JUNK_TITLE = /(调研|座谈|股东户数|户均持|读懂了|讨论区|招聘|免责声明|活动预告)/;
 let dailyRunning = false;
 async function collectDaily() {
   const all = [];
@@ -333,9 +334,11 @@ async function collectDaily() {
   return dedupeSort(selectBalanced(all), 72).slice(0, DAILY_MAX);
 }
 function selectBalanced(all) {
-  // 平衡取样：每个主题最多 4 条，优先"标题含主题词"的条目（压掉股东户数这类噪声）
+  // 平衡取样：每主题最多 4 条、优先标题含主题词；先滤掉高校/公告/导流类噪声
+  const clean = all.filter(it => !JUNK_TITLE.test(String(it.title) + ' ' + String(it.source)));
+  const src = clean.length >= 12 ? clean : all;     // 滤太狠就放宽，保证 15 条
   const byTopic = new Map();
-  for (const it of all) { const a = byTopic.get(it.topic) || []; a.push(it); byTopic.set(it.topic, a); }
+  for (const it of src) { const a = byTopic.get(it.topic) || []; a.push(it); byTopic.set(it.topic, a); }
   const pool = [];
   for (const [t, arr] of byTopic) {
     arr.sort((x, y) => (y.time || '').localeCompare(x.time || ''));
@@ -426,8 +429,8 @@ async function selfUpdate(from) {
     fs.writeFileSync(tmp, src);
     fs.renameSync(tmp, __filename);            // 原子替换（目录可写即可，不依赖旧文件属主）
     try { fs.chmodSync(__filename, 0o755); } catch {}
-    await sendText(from, `乐哥 新版已写入（${src.length} 字节），正在重启进程，约 15 秒后生效。若没动静，面板点一次 Restart。`, ctxTokens[from]);
-    log('INFO', `self-update applied ${src.length}B → exiting for restart`);
+    await sendText(from, `乐哥 新版已写入（${Buffer.byteLength(src)} 字节），正在重启进程，约 15 秒后生效。若没动静，面板点一次 Restart。`, ctxTokens[from]);
+    log('INFO', `self-update applied ${Buffer.byteLength(src)}B → exiting for restart`);
     setTimeout(() => process.exit(0), 1500);
   } catch (e) {
     updating = false;
@@ -545,8 +548,10 @@ process.on('unhandledRejection', e => log('ERROR', 'unhandledRejection ' + (e &&
   if (mode === '--selftest-daily') {   // 自检日报聚合（不碰 iLink）：node index.js --selftest-daily
     const t0 = Date.now();
     const top = await collectDaily();
+    const body = buildReply(`📰 今日要闻 · ${nowCST().slice(0, 10)} · ${top.length} 条`, '', top);
     console.log(`[selftest] daily items=${top.length} 用时=${((Date.now() - t0) / 1000).toFixed(1)}s rss=${process.memoryUsage().rss / 1048576 | 0}MB`);
-    console.log(top.map((it, i) => `${i + 1}. ${it.title}（${it.source}）${fmtCST(it.time)}\n   ${it.url}`).join('\n'));
+    console.log(`----- 日报微信原文（${body.length} 字）-----`);
+    console.log(body);
     process.exit(top.length ? 0 : 1);
   }
   if (mode === 'qrlogin') { const ok = await qrLogin(); process.exit(ok ? 0 : 1); }
