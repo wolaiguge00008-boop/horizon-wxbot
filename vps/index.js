@@ -41,6 +41,10 @@ const STATE_DIR = env('WXBOT_STATE_DIR', '/home/container/state');
 const SECRETS_FILE = env('WXBOT_SECRETS', '/home/container/.secrets');
 const AI_TIMEOUT_MS = Number(env('WXBOT_AI_TIMEOUT_MS', '60000'));
 const MAX_ITEMS = 8, AI_ITEM_CAP = 12, DAILY_MAX = 15;
+// 乐哥要求：回复只给内容，不带网站链接（要链接就把 WXBOT_LINKS=true 写进 .secrets）
+const WITH_LINKS = String(env('WXBOT_LINKS', 'false')).toLowerCase() === 'true';
+// 自更新源：微信发「更新」→ 从这拉最新 index.js 覆盖自己 → 重启生效
+const UPDATE_URL = env('WXBOT_UPDATE_URL', 'https://raw.githubusercontent.com/wolaiguge00008-boop/horizon-wxbot/main/vps/index.js');
 const HONOR = '用户是"乐哥"，你每次回复必须以"乐哥 "（带空格）开头，全程尊称"您"，风格干脆简洁。';
 
 fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -219,6 +223,7 @@ async function fetchBing(q) {
     try { source = new URL(url).hostname.replace(/^www\./, ''); } catch {}
     items.push({ title, url, source: source || 'Bing', time: pickTag(b, 'pubDate') ? new Date(pickTag(b, 'pubDate')).toISOString() : '' });
   }
+  if (!items.length) log('WARN', `Bing 0 条（HTTP 200, ${xml.length}B，正文开头：${xml.replace(/\s+/g, ' ').slice(0, 160)}）`);
   return items;
 }
 const normTitle = t => String(t).replace(/[\s\p{P}\p{S}]/gu, '').toLowerCase();
@@ -288,6 +293,19 @@ const listOf = (items, withUrl) => items.map((it, i) =>
   `${i + 1}. ${it.title || '(无标题)'}${it.source ? '（' + it.source + '）' : ''}${it.time ? ' ' + fmtCST(it.time) : ''}${withUrl && it.url ? '\n   ' + it.url : ''}`
 ).join('\n');
 
+// 回复排版（乐哥要求：只给内容，不带网址）
+function buildReply(titleLine, aiHead, items) {
+  const lines = [titleLine];
+  if (aiHead) lines.push('', aiHead);
+  lines.push('', WITH_LINKS ? '—— 原始条目 ——' : '—— 标题 ——', listOf(items, WITH_LINKS));
+  return lines.join('\n');
+}
+// AI 整理提示词（单主题搜索用；selftest 复用同一份）
+const digestMsgs = (topic, items) => ([
+  { role: 'system', content: `你是新闻秘书。当前北京时间：${nowCST()}。${HONOR}只用我给的条目作答，禁用你记忆里的旧闻、不许编时间与数字。输出 3-5 条要点，每条一行、以"· "开头、不超过 40 字，点出最关键的信息与方向（涉黄金/白银/原油标注 利多/利空/中性）。不要写标题列表，不要写链接。` },
+  { role: 'user', content: `主题「${topic}」，以下是刚抓到的 ${items.length} 条新闻（新→旧）：\n` + listOf(items.slice(0, AI_ITEM_CAP), false) },
+]);
+
 async function answerNews(from, topic) {
   const items = await searchNews(topic);
   if (!items.length) {
@@ -296,12 +314,9 @@ async function answerNews(from, topic) {
   }
   let head = '';
   try {
-    head = await agnes([
-      { role: 'system', content: `你是新闻秘书。当前北京时间：${nowCST()}。${HONOR}只用我给的条目作答，禁用你记忆里的旧闻、不许编时间与数字。输出 3-5 条要点，每条一行、以"· "开头、不超过 40 字，点出最关键的信息与方向（涉黄金/白银/原油标注 利多/利空/中性）。不要写标题列表，不要写链接。` },
-      { role: 'user', content: `主题「${topic}」，以下是刚抓到的 ${items.length} 条新闻（新→旧）：\n` + listOf(items.slice(0, AI_ITEM_CAP), false) },
-    ], AI_TIMEOUT_MS, 700);
+    head = await agnes(digestMsgs(topic, items), AI_TIMEOUT_MS, 700);
   } catch (e) { log('WARN', 'ai digest fail ' + e.message); }
-  const body = `🔎 ${topic} · 近 3 天 · ${items.length} 条${head ? '\n\n' + head : ''}\n\n—— 原始条目 ——\n` + listOf(items, true);
+  const body = buildReply(`🔎 ${topic} · 近 3 天 · ${items.length} 条`, head, items);
   await sendChunks(from, body, ctxTokens[from]);
   log('INFO', `news reply sent topic=${topic} items=${items.length} ai=${head ? 'ok' : 'off'}`);
 }
@@ -343,7 +358,7 @@ async function answerDaily(from) {
         { role: 'user', content: `今日候选要闻（新→旧，共 ${top.length} 条）：\n` + listOf(top, false) },
       ], AI_TIMEOUT_MS, 800);
     } catch (e) { log('WARN', 'daily ai fail ' + e.message); }
-    const body = `📰 今日要闻 · ${nowCST().slice(0, 10)} · ${top.length} 条${head ? '\n\n' + head : ''}\n\n—— 原始条目 ——\n` + listOf(top, true);
+    const body = buildReply(`📰 今日要闻 · ${nowCST().slice(0, 10)} · ${top.length} 条`, head, top);
     await sendChunks(from, body, ctxTokens[from]);
     log('INFO', `daily sent items=${top.length} ai=${head ? 'ok' : 'off'}`);
   } catch (e) {
@@ -373,7 +388,8 @@ const HELP = `乐哥 我在这儿，用法就三条：
 2. 发「日报」—— 7 个主题（金/银/油/美联储/A股/苹果/科技）汇总一份要闻。
 3. 随便聊 —— 问别的也行。
 
-数据来自 GDELT + Google News（免费公开源），实时抓取，不用本机开机。`;
+发「更新」= 让我升级到最新版（不用您再传文件）。
+数据来自 GDELT + Google News + Bing News（免费公开源），实时抓取，不看您电脑开没开。`;
 
 const chatHistFile = path.join(STATE_DIR, ACCOUNT_ID + '.chat.json');
 let chatHist = loadJson(chatHistFile, {}) || {};
@@ -392,6 +408,34 @@ async function chatReply(userText, from) {
   return content;
 }
 
+// ── 自更新：微信发「更新」→ 从 GitHub 拉最新 index.js 覆盖自己 → 退出让面板拉起新版 ──
+let updating = false;
+async function selfUpdate(from) {
+  if (updating) { await sendText(from, '乐哥 正在更新中，稍等十几秒。', ctxTokens[from]); return; }
+  updating = true;
+  try {
+    const r = await fetch(UPDATE_URL + '?t=' + Date.now(), { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(25000) });
+    if (!r.ok) throw new Error('下载失败 HTTP ' + r.status);
+    const src = await r.text();
+    if (src.length < 10000) throw new Error('文件太小 ' + src.length + 'B');
+    if (!src.includes('v4-simple')) throw new Error('不是 wxbot 代码（缺版本标记）');
+    try { new Function(src); } catch (e) { throw new Error('语法校验不过：' + e.message); }   // 只编译不执行
+    let cur = ''; try { cur = fs.readFileSync(__filename, 'utf8'); } catch {}
+    if (cur.trim() === src.trim()) { updating = false; await sendText(from, '乐哥 已经是最新版，不用更新。', ctxTokens[from]); return; }
+    const tmp = __filename + '.new' + process.pid;
+    fs.writeFileSync(tmp, src);
+    fs.renameSync(tmp, __filename);            // 原子替换（目录可写即可，不依赖旧文件属主）
+    try { fs.chmodSync(__filename, 0o755); } catch {}
+    await sendText(from, `乐哥 新版已写入（${src.length} 字节），正在重启进程，约 15 秒后生效。若没动静，面板点一次 Restart。`, ctxTokens[from]);
+    log('INFO', `self-update applied ${src.length}B → exiting for restart`);
+    setTimeout(() => process.exit(0), 1500);
+  } catch (e) {
+    updating = false;
+    log('WARN', 'self-update fail ' + e.message);
+    await sendText(from, '乐哥 更新失败：' + e.message + '。原文件没动，服务照常。', ctxTokens[from]);
+  }
+}
+
 async function handleInbound(m) {
   const from = String(m.from_user_id || '').trim();
   if (!from) return;
@@ -402,6 +446,7 @@ async function handleInbound(m) {
   text = text.trim(); if (!text) return;
   try {
     if (/^(帮助|命令|help|用法|怎么用|说明)$/i.test(text)) { await sendChunks(from, HELP, ctxTokens[from]); return; }
+    if (/^(更新|升级|更新版本|升级版本|update)$/i.test(text)) { await selfUpdate(from); return; }
     if (text.includes('日报') || text.includes('每日报告') || text.includes('今日报') || text.includes('要闻')) { await answerDaily(from); return; }
     if (isNewsAsk(text)) { await answerNews(from, extractTopic(text)); return; }
     const reply = await chatReply(text, from);
@@ -486,6 +531,16 @@ process.on('unhandledRejection', e => log('ERROR', 'unhandledRejection ' + (e &&
       console.log('[selftest] AI 导读:\n' + head);
     } catch (e) { console.log('[selftest] AI 失败(会降级纯列表)：' + e.message); }
     process.exit(items.length ? 0 : 1);
+  }
+  if (mode === '--selftest-reply') {   // 自检：打印"微信里会收到的原文"（不发消息）
+    const topic = process.argv[3] || '黄金';
+    const items = await searchNews(topic);
+    let head = '';
+    try { head = await agnes(digestMsgs(topic, items), AI_TIMEOUT_MS, 700); } catch (e) { head = ''; log('WARN', 'ai fail ' + e.message); }
+    const body = buildReply(`🔎 ${topic} · 近 3 天 · ${items.length} 条`, head, items);
+    console.log(`----- 微信里会收到的原文（${body.length} 字，会分成 ${Math.ceil(body.length / SPLIT_THRESHOLD)} 条）-----`);
+    console.log(body);
+    process.exit(0);
   }
   if (mode === '--selftest-daily') {   // 自检日报聚合（不碰 iLink）：node index.js --selftest-daily
     const t0 = Date.now();
