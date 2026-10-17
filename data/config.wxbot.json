@@ -1,0 +1,47 @@
+{
+  "ai": {
+    "provider": "openai",
+    "model": "agnes-3.0-flash",
+    "base_url": "https://apihub.agnes-ai.com/v1",
+    "api_key_env": "AGNES_API_KEY",
+    "temperature": 0.3,
+    "max_tokens": 4096,
+    "throttle_sec": 0.4,
+    "analysis_concurrency": 2,
+    "enrichment_concurrency": 1,
+    "languages": ["zh", "en"]
+  },
+  "processing": {
+    "profiles_dir": "profiles",
+    "default_profile": "finance-news",
+    "profile_settings": {
+      "finance-news": { "threshold": 5.0, "topic_dedup": true },
+      "tech-news": { "threshold": 5.0, "topic_dedup": true }
+    }
+  },
+  "collection": { "time_window_hours": 24 },
+  "digest": {
+    "max_items": 15,
+    "profile_order": ["finance-news", "tech-news"]
+  },
+  "sources": {
+    "gdelt": {
+      "enabled": true,
+      "query": "gold OR silver OR Fed OR crude oil OR Apple foldable OR OpenAI",
+      "mode": "ArtList",
+      "max_records": 20,
+      "timespan": "24h",
+      "category": "finance",
+      "profile": "finance-news"
+    },
+    "google_news": {
+      "enabled": true,
+      "query": "黄金 OR 白银 OR 美联储 OR 原油 OR 苹果 OR 美股 OR 科技",
+      "language": "zh",
+      "country": "CN",
+      "max_results": 40,
+      "category": "finance",
+      "profile": "finance-news"
+    }
+  }
+}
