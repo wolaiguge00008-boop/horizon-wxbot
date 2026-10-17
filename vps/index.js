@@ -1,9 +1,11 @@
-// iLink 微信云端问答机器人 — v4「极简版」（Pterodactyl 容器 / Node 22+ / 零依赖）
+// iLink 微信云端问答机器人 — v5「内容版」（Pterodactyl 容器 / Node 22+ / 零依赖）
+// 兼容标记（旧版 v4 的自更新会校验这个串，别删）: v4-simple
 // 设计目标：400MB 内存里稳定跑。没有 Python、没有 uv、没有任何安装步骤，只有 Node + 网络。
-//   ① 您问什么新闻 → GDELT + Google News 实时搜 → AI 整理 → 回微信
-//   ② 发「日报」 → 默认关键词组聚合一份要闻（同样零安装，30-60 秒）
+//   ① 您问什么新闻 → Bing + Google News + GDELT 实时搜 → 抓正文 → AI 评分+摘要 → 按重要性排序回微信
+//   ② 发「日报」 → 7 主题聚合 → 同样评分+摘要 → 15 条要闻
 //   ③ 其他闲聊 → AI 直接回
-// 部署：只传本文件到 /home/container/ → 面板 Restart。自检：node index.js --selftest 黄金
+// 内容资产移植自 ThysraelHorizon 的 finance-news profile（评分表 9-10 系统性 … 0-2 噪声；摘要规范）
+// 部署：只传本文件到 /home/container/ → 面板 Restart。自检：node index.js --selftest-reply 黄金
 (function loadSecrets() {
   const fs = require('fs');
   const f = process.env.WXBOT_SECRETS || '/home/container/.secrets';
@@ -19,7 +21,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const VERSION = 'v4-simple';
+const VERSION = 'v5-content';
 // ── iLink 协议常量（与本地 Hermes weixin.py 对齐）──
 const ILINK_APP_ID = 'bot';
 const ILINK_CHANNEL_VERSION = '2.2.0';
@@ -41,6 +43,11 @@ const STATE_DIR = env('WXBOT_STATE_DIR', '/home/container/state');
 const SECRETS_FILE = env('WXBOT_SECRETS', '/home/container/.secrets');
 const AI_TIMEOUT_MS = Number(env('WXBOT_AI_TIMEOUT_MS', '60000'));
 const MAX_ITEMS = 8, AI_ITEM_CAP = 12, DAILY_MAX = 15;
+// 正文抓取与评分（v5）：条数要克制，400MB 容器里 HTTP 并发 4 是安全线
+const BODY_BUDGET_NEWS = 8, BODY_BUDGET_DAILY = 14, BODY_LIMIT_NEWS = 1500, BODY_LIMIT_DAILY = 1100;
+const FETCH_CONCURRENCY = 4;
+const SCORE_TIMEOUT_MS = Number(env('WXBOT_SCORE_TIMEOUT_MS', '90000'));
+const MIN_SCORE = Number(env('WXBOT_MIN_SCORE', '3'));   // 评分低于此值且条数够 → 当噪声丢掉
 // 乐哥要求：回复只给内容，不带网站链接（要链接就把 WXBOT_LINKS=true 写进 .secrets）
 const WITH_LINKS = String(env('WXBOT_LINKS', 'false')).toLowerCase() === 'true';
 // 自更新源：微信发「更新」→ 拉最新 index.js 覆盖自己 → 重启生效
@@ -186,7 +193,7 @@ async function fetchGdelt(query) {
   const d = await r.json();
   const art = (d.artifacts || d.data || []);
   return art.slice(0, MAX_ITEMS).map(a => ({
-    title: deEnt(a.title || ''), url: a.url || '', source: 'GDELT',
+    title: deEnt(a.title || ''), url: a.url || '', source: 'GDELT', direct: true,
     time: a.seendate ? new Date(a.seendate.replace(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/, '$1-$2-$3T$4:$5:$6Z')).toISOString() : '',
   }));
 }
@@ -223,7 +230,7 @@ async function fetchBing(q) {
     if (!title) continue;
     let source = '';
     try { source = new URL(url).hostname.replace(/^www\./, ''); } catch {}
-    items.push({ title, url, source: source || 'Bing', time: pickTag(b, 'pubDate') ? new Date(pickTag(b, 'pubDate')).toISOString() : '' });
+    items.push({ title, url, source: source || 'Bing', direct: true, time: pickTag(b, 'pubDate') ? new Date(pickTag(b, 'pubDate')).toISOString() : '' });
   }
   if (!items.length) log('WARN', `Bing 0 条（HTTP 200, ${xml.length}B，正文开头：${xml.replace(/\s+/g, ' ').slice(0, 160)}）`);
   return items;
@@ -294,33 +301,157 @@ async function agnes(messages, timeoutMs, maxTokens) {
 const listOf = (items, withUrl) => items.map((it, i) =>
   `${i + 1}. ${it.title || '(无标题)'}${it.source ? '（' + it.source + '）' : ''}${it.time ? ' ' + fmtCST(it.time) : ''}${withUrl && it.url ? '\n   ' + it.url : ''}`
 ).join('\n');
+const fmtScore = n => (n == null || !isFinite(n)) ? '' : (Number.isInteger(Number(n)) ? String(Number(n)) : Number(n).toFixed(1));
+
+// ── ① 正文抓取（替代 trafilatura：去脚本样式 → 取正文段落，限 4 并发）──
+function looksLikeCode(t) {
+  if (!t) return true;
+  const junk = (String(t).match(/[{}<>;=\\]|function\s|var\s|window\.|document\.|=>/g) || []).length;
+  return junk > t.length / 40;      // 2.5% 以上是代码符号 → 判为脚本/CSS 残留
+}
+function stripTags(s) {
+  return String(s).replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<(script|style|noscript|svg|iframe|template|canvas)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')   // 连内容一起删（旧版只删了标签，JS 全漏出来）
+    .replace(/<(script|style|noscript)\b[^>]*>[\s\S]*$/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/\s+/g, ' ').trim();
+}
+function decodeBody(buf) {
+  const head = Buffer.from(buf.slice(0, 4096)).toString('latin1');
+  const m = head.match(/charset\s*=\s*["']?([\w-]+)/i);
+  let enc = 'utf8';
+  if (m) {
+    const e = m[1].toLowerCase();
+    if (/gb2312|gbk|gb18030/.test(e)) enc = 'gbk'; else if (/big5/.test(e)) enc = 'big5';
+  }
+  try { return new TextDecoder(enc).decode(buf); } catch { return Buffer.from(buf).toString('utf8'); }
+}
+function extractArticle(html, limit) {
+  const h = String(html);
+  let meta = '';
+  const md = h.match(/<meta[^>]+(?:name|property)=["'](?:description|og:description)["'][^>]*>/i);
+  if (md) { const c = md[0].match(/content=["']([^"']*)["']/i); if (c) meta = deEnt(c[1]); }
+  let scope = h;
+  const art = h.match(/<article[\s\S]{0,300000}?<\/article>/i) || h.match(/<main[\s\S]{0,300000}?<\/main>/i);
+  if (art) scope = art[0];
+  const ps = [...scope.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/gi)].map(x => stripTags(x[1])).filter(t => t.length >= 24 && !looksLikeCode(t));
+  let text = ps.join(' ');
+  if (text.length < 200) { const alt = stripTags(scope); if (!looksLikeCode(alt)) text = (alt + ' ' + text).trim(); }
+  if (text.length < 120 && meta) text = meta + ' ' + text;
+  return text.replace(/\s+/g, ' ').slice(0, limit).trim();
+}
+async function fetchArticleText(url, limit) {
+  const r = await fetch(url, { headers: { 'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' }, signal: AbortSignal.timeout(9000), redirect: 'follow' });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const ct = String(r.headers.get('content-type') || '');
+  if (!/text\/html|text\/plain|xhtml/i.test(ct)) throw new Error('非网页(' + ct.split(';')[0].slice(0, 24) + ')');
+  const buf = await r.arrayBuffer();
+  if (buf.byteLength > 900 * 1024) throw new Error('页面过大');
+  const t = extractArticle(decodeBody(buf), limit);
+  if (t.length < 60) throw new Error('正文太短');
+  return t;
+}
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length); let i = 0;
+  const n = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: n }, async () => {
+    while (i < items.length) { const k = i++; try { out[k] = await fn(items[k], k); } catch { out[k] = null; } }
+  }));
+  return out;
+}
+// 只抓"直链"条目（Bing 拆包后的原站、GDELT）；Google News 是跳转页，抓不到正文，跳过
+async function enrichBodies(items, budget, perLimit) {
+  const targets = items.filter(it => it.direct && /^https?:\/\//.test(String(it.url || ''))).slice(0, budget);
+  log('INFO', `enrich pool n=${items.length} direct=${items.filter(x => x.direct).length} httpUrl=${items.filter(x => /^https?:\/\//.test(String(x.url || ''))).length} targets=${targets.length}`);
+  let ok = 0;
+  await mapLimit(targets, FETCH_CONCURRENCY, async it => {
+    try { it.body = await fetchArticleText(it.url, perLimit); ok++; }
+    catch (e) { log('WARN', `body fail ${it.source || ''} ${String(e.message).slice(0, 60)}`); }
+  });
+  log('INFO', `bodies ${ok}/${targets.length}`);
+  return items;
+}
+
+// ── ② AI 评分 + 一句话摘要（资产移植：评分表 + 摘要规范）──
+const SCORE_SYS = `你是财经新闻编辑。当前北京时间：${nowCST()}。${HONOR}
+【任务】给每条新闻打分，并写一句内容摘要。
+【评分标准 0-10】
+- 9-10 系统性：重大货币或财政政策转向、严重市场动荡、标志性监管、影响面很广的公司事件
+- 7-8 重要：重大财报意外、重大融资或并购、影响明确的经济数据或政策变化
+- 5-6 有用：可信、具体的进展，能帮读者理解某公司、某个市场或趋势，但广度或紧迫性有限
+- 3-4 低价值：常规价格波动、预期内的结果、小额交易、缺基线的预测
+- 0-2 噪声：传闻、荐股或推广、没有解释的数字、耸动预测、没有可靠财经实质（例如把"黄金周旅游"当成金价新闻）
+【评估要点】看事件规模与影响面、来源质量、时效性、是否给出带基线的具体数字；区分已报道事实与预测、观点；不因涨幅大就加分（必须看基数）；不把热度当重要性。
+【摘要规范】每条一句话、最多 45 字：先说事件，再给最关键的数字或政策变化，保留货币、单位、时间区间与比较基准；公司说法、分析师预测、指控、提案都要标明来源；不确定的就别写，绝不编造；不要写"属重大事件""值得关注""影响深远"这类评价套话，直接给事实和数字。
+【输出格式】只输出一个 JSON 数组，不要解释、不要代码块、不要多余文字：
+[{"i":1,"score":8.5,"tags":["黄金","央行购金"],"summary":"一句话摘要"}]`;
+function parseJsonArray(s) {
+  let t = String(s).replace(/```[a-z]*/gi, '').trim();
+  const a = t.indexOf('['), b = t.lastIndexOf(']');
+  if (a >= 0 && b > a) t = t.slice(a, b + 1);
+  try { const j = JSON.parse(t); if (Array.isArray(j)) return j; } catch {}
+  const out = []; const re = /\{[^{}]*\}/g; let m;      // 容错：逐个对象抠
+  while ((m = re.exec(t))) { try { const o = JSON.parse(m[0]); if (o && typeof o === 'object') out.push(o); } catch {} }
+  return out;
+}
+async function scoreItems(topic, items) {
+  const user = `主题「${topic}」，共 ${items.length} 条（新→旧）：\n\n` + items.map((it, i) =>
+    `【${i + 1}】${it.title || ''}（${it.source || ''} ${fmtCST(it.time)}）${it.body ? '\n正文节选：' + it.body : ''}`).join('\n\n');
+  const raw = await agnes([{ role: 'system', content: SCORE_SYS }, { role: 'user', content: user }], SCORE_TIMEOUT_MS, 2800);
+  const arr = parseJsonArray(raw);
+  const byIdx = new Map();
+  for (const o of arr) { const i = Number(o && o.i); if (i >= 1 && i <= items.length && !byIdx.has(i)) byIdx.set(i, o); }
+  let hit = 0;
+  const scored = items.map((it, k) => {
+    const o = byIdx.get(k + 1);
+    const sc = o && isFinite(Number(o.score)) ? Number(o.score) : null;
+    if (sc != null) hit++;
+    return { ...it, score: sc, tags: (o && Array.isArray(o.tags)) ? o.tags.slice(0, 5).map(String) : [], summary: (o && o.summary) ? String(o.summary).replace(/\s+/g, ' ').slice(0, 90) : '' };
+  });
+  log('INFO', `scored ${hit}/${items.length}（原始输出 ${raw.length} 字）`);
+  return scored;
+}
+function rankItems(items, keep) {
+  if (!items.some(x => typeof x.score === 'number' && isFinite(x.score))) return items.slice(0, keep);   // AI 没给分 → 保持时间序
+  const sorted = items.slice().sort((a, b) => (b.score || 0) - (a.score || 0));
+  const good = sorted.filter(x => !(typeof x.score === 'number' && x.score < MIN_SCORE));
+  const floor = Math.min(6, keep);                                            // 至少保 6 条，别筛太狠；分数[1][2]那种就是给您看的"这条不用看"
+  return (good.length >= floor ? good : sorted.slice(0, floor)).slice(0, keep);
+}
 
 // 回复排版（乐哥要求：只给内容，不带网址）
+function renderItems(items) {
+  return items.map((it, i) => {
+    const sc = fmtScore(it.score);
+    const head = `${i + 1}. ${sc ? '[' + sc + '] ' : ''}${it.title || '(无标题)'}${it.source ? '（' + it.source + '）' : ''}${it.time ? ' ' + fmtCST(it.time) : ''}`;
+    const extra = it.summary ? '\n   ' + it.summary : (WITH_LINKS && it.url ? '\n   ' + it.url : '');
+    return head + extra + (WITH_LINKS && it.summary && it.url ? '\n   ' + it.url : '');
+  }).join('\n');
+}
 function buildReply(titleLine, aiHead, items) {
   const lines = [titleLine];
   if (aiHead) lines.push('', aiHead);
-  lines.push('', WITH_LINKS ? '—— 原始条目 ——' : '—— 标题 ——', listOf(items, WITH_LINKS));
+  lines.push('', WITH_LINKS ? '—— 原始条目 ——' : (items.some(x => x.summary) ? '—— 内容（按重要性）——' : '—— 标题 ——'), renderItems(items));
   return lines.join('\n');
 }
-// AI 整理提示词（单主题搜索用；selftest 复用同一份）
-const digestMsgs = (topic, items) => ([
-  { role: 'system', content: `你是新闻秘书。当前北京时间：${nowCST()}。${HONOR}只用我给的条目作答，禁用你记忆里的旧闻、不许编时间与数字。输出 3-5 条要点，每条一行、以"· "开头、不超过 40 字，点出最关键的信息与方向（涉黄金/白银/原油标注 利多/利空/中性）。不要写标题列表，不要写链接。` },
-  { role: 'user', content: `主题「${topic}」，以下是刚抓到的 ${items.length} 条新闻（新→旧）：\n` + listOf(items.slice(0, AI_ITEM_CAP), false) },
-]);
 
 async function answerNews(from, topic) {
   const items = await searchNews(topic);
   if (!items.length) {
-    await sendText(from, `乐哥 没搜到「${topic}」的近期公开报道（GDELT+Google News 近 3 天）。不编旧闻，换个关键词再问，或试试「日报」。`, ctxTokens[from]);
+    await sendText(from, `乐哥 没搜到「${topic}」的近期公开报道（Bing+Google News+GDELT 近 3 天）。不编旧闻，换个关键词再问，或试试「日报」。`, ctxTokens[from]);
     return;
   }
-  let head = '';
-  try {
-    head = await agnes(digestMsgs(topic, items), AI_TIMEOUT_MS, 700);
-  } catch (e) { log('WARN', 'ai digest fail ' + e.message); }
-  const body = buildReply(`🔎 ${topic} · 近 3 天 · ${items.length} 条`, head, items);
+  const cands = items.slice(0, AI_ITEM_CAP);
+  await enrichBodies(cands, BODY_BUDGET_NEWS, BODY_LIMIT_NEWS);      // 抓正文 → 摘要基于内容而不是标题
+  let scored = [];
+  try { scored = await scoreItems(topic, cands); } catch (e) { log('WARN', 'ai score fail ' + e.message); }
+  const ranked = rankItems(scored.length ? scored : cands, MAX_ITEMS);   // 按重要性排序 + 低分当噪声丢掉
+  const gotBody = cands.filter(x => x.body).length;
+  const body = buildReply(`🔎 ${topic} · 近 3 天 · 抓到 ${items.length} 条 → 精选 ${ranked.length} 条`, '', ranked);
   await sendChunks(from, body, ctxTokens[from]);
-  log('INFO', `news reply sent topic=${topic} items=${items.length} ai=${head ? 'ok' : 'off'}`);
+  log('INFO', `news reply sent topic=${topic} picked=${ranked.length} scored=${scored.some(x => x.score != null) ? 'ok' : 'off'} bodies=${gotBody}`);
 }
 
 const DAILY_TOPICS = ['黄金', '白银', '原油', '美联储', 'A股', '苹果', '科技'];
@@ -333,7 +464,14 @@ async function collectDaily() {
     const res = await Promise.all(batch.map(t => searchNews(t).catch(() => [])));
     batch.forEach((t, k) => { for (const it of res[k]) all.push({ ...it, topic: t }); });
   }
-  return dedupeSort(selectBalanced(all), 72).slice(0, DAILY_MAX);
+  return (() => {
+    const pool = dedupeSort(selectBalanced(all), 72);
+    // 直链占七成（能抓正文 → 摘要有内容），其余留给 Google News 补广度；先按配额取，再按时间排
+    const direct = pool.filter(x => x.direct), rest = pool.filter(x => !x.direct);
+    const chosen = [...direct.slice(0, Math.ceil(DAILY_MAX * 0.7)), ...rest].slice(0, DAILY_MAX);
+    chosen.sort((a, b) => (b.time || '').localeCompare(a.time || ''));
+    return chosen;
+  })();
 }
 function selectBalanced(all) {
   // 平衡取样：每主题最多 4 条、优先标题含主题词；先滤掉高校/公告/导流类噪声
@@ -343,7 +481,8 @@ function selectBalanced(all) {
   for (const it of src) { const a = byTopic.get(it.topic) || []; a.push(it); byTopic.set(it.topic, a); }
   const pool = [];
   for (const [t, arr] of byTopic) {
-    arr.sort((x, y) => (y.time || '').localeCompare(x.time || ''));
+    // 直链优先（Bing/GDELT 能抓正文 → 摘要基于内容），同级再按时间新→旧；Google 跳转页补位
+    arr.sort((x, y) => ((y.direct ? 1 : 0) - (x.direct ? 1 : 0)) || (y.time || '').localeCompare(x.time || ''));
     const hit = arr.filter(it => String(it.title).includes(t));
     pool.push(...(hit.length >= 2 ? hit.slice(0, 4) : arr.slice(0, 4)));
   }
@@ -353,19 +492,22 @@ async function answerDaily(from) {
   if (dailyRunning) { await sendText(from, '乐哥 上一份还在生成，稍等 1 分钟。', ctxTokens[from]); return; }
   dailyRunning = true;
   try {
-    await sendText(from, '乐哥 收到，正在搜今日要闻（7 个主题 × 3 个源），约 1 分钟。', ctxTokens[from]);
+    await sendText(from, '乐哥 收到，正在搜今日要闻（7 主题 × 3 源，抓正文 + 评分排序），约 1-2 分钟。', ctxTokens[from]);
     const top = await collectDaily();
-    if (!top.length) { await sendText(from, '乐哥 今天两个源都没返回内容（可能网络受限），稍后再试。', ctxTokens[from]); return; }
+    if (!top.length) { await sendText(from, '乐哥 今天几个源都没返回内容（可能网络受限），稍后再试。', ctxTokens[from]); return; }
+    await enrichBodies(top, BODY_BUDGET_DAILY, BODY_LIMIT_DAILY);
+    let ranked = top;
+    try { ranked = rankItems(await scoreItems('今日要闻', top), DAILY_MAX); } catch (e) { log('WARN', 'daily score fail ' + e.message); }
     let head = '';
     try {
       head = await agnes([
         { role: 'system', content: `你是新闻秘书。当前北京时间：${nowCST()}。${HONOR}只用我给的条目作答，禁用旧闻与编造。给一份极简早报导读：4-6 行，每行"· "开头、≤40 字，按 贵金属 / 能源 / 宏观 / 股市 / 科技 归类要点，涉黄金白银原油标 利多/利空/中性。不要链接、不要编号列表。` },
-        { role: 'user', content: `今日候选要闻（新→旧，共 ${top.length} 条）：\n` + listOf(top, false) },
+        { role: 'user', content: `今日候选要闻（已按重要性排序，共 ${ranked.length} 条）：\n` + ranked.map((it, i) => `${i + 1}. ${it.title}${it.summary ? ' —— ' + it.summary : ''}`).join('\n') },
       ], AI_TIMEOUT_MS, 800);
     } catch (e) { log('WARN', 'daily ai fail ' + e.message); }
-    const body = buildReply(`📰 今日要闻 · ${nowCST().slice(0, 10)} · ${top.length} 条`, head, top);
+    const body = buildReply(`📰 今日要闻 · ${nowCST().slice(0, 10)} · 精选 ${ranked.length} 条`, head, ranked);
     await sendChunks(from, body, ctxTokens[from]);
-    log('INFO', `daily sent items=${top.length} ai=${head ? 'ok' : 'off'}`);
+    log('INFO', `daily sent items=${ranked.length} bodies=${top.filter(x => x.body).length} ai=${head ? 'ok' : 'off'}`);
   } catch (e) {
     log('WARN', 'daily fail ' + e.message);
     await sendText(from, '乐哥 日报这次没生成成功（' + e.message + '），再发一次「日报」重试。', ctxTokens[from]);
@@ -389,12 +531,12 @@ function extractTopic(t) {
 }
 const HELP = `乐哥 我在这儿，用法就三条：
 
-1. 直接问新闻 —— 例如「黄金」「苹果折叠屏最新消息」「伊朗局势」，我实时搜了整理给您。
-2. 发「日报」—— 7 个主题（金/银/油/美联储/A股/苹果/科技）汇总一份要闻。
+1. 直接问新闻 —— 例如「黄金」「苹果折叠屏最新消息」「伊朗局势」。我实时搜 3 个源、抓正文、按重要性评分排序，每条给您一句内容摘要（不编、不给链接）。
+2. 发「日报」—— 7 个主题（金/银/油/美联储/A股/苹果/科技）汇总 15 条要闻，约 1-2 分钟。
 3. 随便聊 —— 问别的也行。
 
 发「更新」= 让我升级到最新版（不用您再传文件）。
-数据来自 GDELT + Google News + Bing News（免费公开源），实时抓取，不看您电脑开没开。`;
+评分标准来自您本机 ThysraelHorizon 技能的 finance-news 档案（9-10 系统性 … 0-2 噪声）。`;
 
 const chatHistFile = path.join(STATE_DIR, ACCOUNT_ID + '.chat.json');
 let chatHist = loadJson(chatHistFile, {}) || {};
@@ -433,7 +575,7 @@ async function selfUpdate(from) {
       } catch (e) { lastErr = e; log('WARN', 'update fetch fail ' + e.message); }
     }
     if (!src || src.length < 10000) throw new Error('下载失败：' + (lastErr ? lastErr.message : '空内容'));
-    if (!src.includes('v4-simple')) throw new Error('不是 wxbot 代码（缺版本标记）');
+    if (!/v[45]-(simple|content)/.test(src)) throw new Error('不是 wxbot 代码（缺版本标记）');
     try { new Function(src); } catch (e) { throw new Error('语法校验不过：' + e.message); }   // 只编译不执行
     let cur = ''; try { cur = fs.readFileSync(__filename, 'utf8'); } catch {}
     if (cur.trim() === src.trim()) { updating = false; await sendText(from, '乐哥 已经是最新版，不用更新。', ctxTokens[from]); return; }
@@ -547,22 +689,29 @@ process.on('unhandledRejection', e => log('ERROR', 'unhandledRejection ' + (e &&
     } catch (e) { console.log('[selftest] AI 失败(会降级纯列表)：' + e.message); }
     process.exit(items.length ? 0 : 1);
   }
-  if (mode === '--selftest-reply') {   // 自检：打印"微信里会收到的原文"（不发消息）
+  if (mode === '--selftest-reply') {   // 自检：跑完整 v5 链路（搜 → 正文 → 评分 → 排序），打印"微信里会收到的原文"，不发消息
     const topic = process.argv[3] || '黄金';
+    const t0 = Date.now();
     const items = await searchNews(topic);
-    let head = '';
-    try { head = await agnes(digestMsgs(topic, items), AI_TIMEOUT_MS, 700); } catch (e) { head = ''; log('WARN', 'ai fail ' + e.message); }
-    const body = buildReply(`🔎 ${topic} · 近 3 天 · ${items.length} 条`, head, items);
-    console.log(`----- 微信里会收到的原文（${body.length} 字，会分成 ${Math.ceil(body.length / SPLIT_THRESHOLD)} 条）-----`);
+    const cands = items.slice(0, AI_ITEM_CAP);
+    await enrichBodies(cands, BODY_BUDGET_NEWS, BODY_LIMIT_NEWS);
+    let scored = [];
+    try { scored = await scoreItems(topic, cands); } catch (e) { log('WARN', 'ai fail ' + e.message); }
+    const ranked = rankItems(scored.length ? scored : cands, MAX_ITEMS);
+    const body = buildReply(`🔎 ${topic} · 近 3 天 · 抓到 ${items.length} 条 → 精选 ${ranked.length} 条`, '', ranked);
+    console.log(`----- 微信原文（${body.length} 字 / 用时 ${((Date.now() - t0) / 1000).toFixed(1)}s / rss ${process.memoryUsage().rss / 1048576 | 0}MB / 抓到正文 ${cands.filter(x => x.body).length} 条 / 会分成 ${Math.ceil(body.length / SPLIT_THRESHOLD)} 条）-----`);
     console.log(body);
     process.exit(0);
   }
-  if (mode === '--selftest-daily') {   // 自检日报聚合（不碰 iLink）：node index.js --selftest-daily
+  if (mode === '--selftest-daily') {   // 自检日报完整链路（不碰 iLink）：node index.js --selftest-daily
     const t0 = Date.now();
     const top = await collectDaily();
-    const body = buildReply(`📰 今日要闻 · ${nowCST().slice(0, 10)} · ${top.length} 条`, '', top);
-    console.log(`[selftest] daily items=${top.length} 用时=${((Date.now() - t0) / 1000).toFixed(1)}s rss=${process.memoryUsage().rss / 1048576 | 0}MB`);
-    console.log(`----- 日报微信原文（${body.length} 字）-----`);
+    await enrichBodies(top, BODY_BUDGET_DAILY, BODY_LIMIT_DAILY);
+    let ranked = top;
+    try { ranked = rankItems(await scoreItems('今日要闻', top), DAILY_MAX); } catch (e) { log('WARN', 'daily score fail ' + e.message); }
+    const body = buildReply(`📰 今日要闻 · ${nowCST().slice(0, 10)} · 精选 ${ranked.length} 条`, '', ranked);
+    console.log(`[selftest] daily items=${ranked.length} 用时=${((Date.now() - t0) / 1000).toFixed(1)}s rss=${process.memoryUsage().rss / 1048576 | 0}MB 正文=${top.filter(x => x.body).length} 条`);
+    console.log(`----- 日报微信原文（${body.length} 字 / 会分成 ${Math.ceil(body.length / SPLIT_THRESHOLD)} 条）-----`);
     console.log(body);
     process.exit(top.length ? 0 : 1);
   }
