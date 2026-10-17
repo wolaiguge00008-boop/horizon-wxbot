@@ -43,8 +43,10 @@ const AI_TIMEOUT_MS = Number(env('WXBOT_AI_TIMEOUT_MS', '60000'));
 const MAX_ITEMS = 8, AI_ITEM_CAP = 12, DAILY_MAX = 15;
 // 乐哥要求：回复只给内容，不带网站链接（要链接就把 WXBOT_LINKS=true 写进 .secrets）
 const WITH_LINKS = String(env('WXBOT_LINKS', 'false')).toLowerCase() === 'true';
-// 自更新源：微信发「更新」→ 从这拉最新 index.js 覆盖自己 → 重启生效
-const UPDATE_URL = env('WXBOT_UPDATE_URL', 'https://raw.githubusercontent.com/wolaiguge00008-boop/horizon-wxbot/main/vps/index.js');
+// 自更新源：微信发「更新」→ 拉最新 index.js 覆盖自己 → 重启生效
+// 主用 GitHub API 直读（不走 raw 的 5 分钟 CDN 缓存），raw 作兜底
+const UPDATE_URL = env('WXBOT_UPDATE_URL', 'https://api.github.com/repos/wolaiguge00008-boop/horizon-wxbot/contents/vps/index.js');
+const UPDATE_URL_FALLBACK = env('WXBOT_UPDATE_URL2', 'https://raw.githubusercontent.com/wolaiguge00008-boop/horizon-wxbot/main/vps/index.js');
 const HONOR = '用户是"乐哥"，你每次回复必须以"乐哥 "（带空格）开头，全程尊称"您"，风格干脆简洁。';
 
 fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -417,10 +419,20 @@ async function selfUpdate(from) {
   if (updating) { await sendText(from, '乐哥 正在更新中，稍等十几秒。', ctxTokens[from]); return; }
   updating = true;
   try {
-    const r = await fetch(UPDATE_URL + '?t=' + Date.now(), { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(25000) });
-    if (!r.ok) throw new Error('下载失败 HTTP ' + r.status);
-    const src = await r.text();
-    if (src.length < 10000) throw new Error('文件太小 ' + src.length + 'B');
+    let src = '', lastErr = null;
+    for (const u of [UPDATE_URL, UPDATE_URL_FALLBACK]) {
+      try {
+        const r = await fetch(u + (u.includes('raw.githubusercontent') ? '?t=' + Date.now() : ''), {
+          headers: { 'User-Agent': UA, Accept: 'application/vnd.github.raw, text/plain, */*' },
+          signal: AbortSignal.timeout(25000),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        src = await r.text();
+        if (src.length >= 10000) break;
+        lastErr = new Error('文件太小 ' + src.length + 'B');
+      } catch (e) { lastErr = e; log('WARN', 'update fetch fail ' + e.message); }
+    }
+    if (!src || src.length < 10000) throw new Error('下载失败：' + (lastErr ? lastErr.message : '空内容'));
     if (!src.includes('v4-simple')) throw new Error('不是 wxbot 代码（缺版本标记）');
     try { new Function(src); } catch (e) { throw new Error('语法校验不过：' + e.message); }   // 只编译不执行
     let cur = ''; try { cur = fs.readFileSync(__filename, 'utf8'); } catch {}
