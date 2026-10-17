@@ -42,12 +42,46 @@ const AGNES_KEY = env('AGNES_API_KEY', '');
 const STATE_DIR = env('WXBOT_STATE_DIR', '/home/container/state');
 const SECRETS_FILE = env('WXBOT_SECRETS', '/home/container/.secrets');
 const AI_TIMEOUT_MS = Number(env('WXBOT_AI_TIMEOUT_MS', '60000'));
-const MAX_ITEMS = 8, AI_ITEM_CAP = 12, DAILY_MAX = 15;
+const MAX_ITEMS = 8, AI_ITEM_CAP = 14, DAILY_MAX = 15;
 // 正文抓取与评分（v5）：条数要克制，400MB 容器里 HTTP 并发 4 是安全线
 const BODY_BUDGET_NEWS = 8, BODY_BUDGET_DAILY = 14, BODY_LIMIT_NEWS = 1500, BODY_LIMIT_DAILY = 1100;
 const FETCH_CONCURRENCY = 4;
 const SCORE_TIMEOUT_MS = Number(env('WXBOT_SCORE_TIMEOUT_MS', '90000'));
 const MIN_SCORE = Number(env('WXBOT_MIN_SCORE', '3'));   // 评分低于此值且条数够 → 当噪声丢掉
+
+// ── 全球免费源（全部零 key，实测可用 2026-10-17）──
+// 金融/地缘/特朗普/美联储优先。每条带 RSS 里的正文摘要（免费内容，不用再抓网页）
+const FEEDS = {
+  trump:    { name: 'Truth Social', url: 'https://trumpstruth.org/feed', limit: 20 },
+  wh:       { name: '白宫', url: 'https://www.whitehouse.gov/presidential-actions/feed/', limit: 6 },
+  fed:      { name: '美联储', url: 'https://www.federalreserve.gov/feeds/press_all.xml', limit: 8 },
+  fedSpeak: { name: '美联储讲话', url: 'https://www.federalreserve.gov/feeds/speeches.xml', limit: 8 },
+  cnbc:     { name: 'CNBC', url: 'https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114', limit: 20 },
+  wsj:      { name: 'WSJ', url: 'https://feeds.a.dj.com/rss/RSSMarketsMain.xml', limit: 12 },
+  bbcW:     { name: 'BBC', url: 'https://feeds.bbci.co.uk/news/world/rss.xml', limit: 20 },
+  bbcB:     { name: 'BBC财经', url: 'https://feeds.bbci.co.uk/news/business/rss.xml', limit: 20 },
+  aj:       { name: '半岛', url: 'https://www.aljazeera.com/xml/rss/all.xml', limit: 20 },
+  toi:      { name: 'Times of Israel', url: 'https://www.timesofisrael.com/feed/', limit: 10 },
+  tass:     { name: 'TASS', url: 'https://tass.com/rss/v2.xml', limit: 12 },
+  scmp:     { name: 'SCMP', url: 'https://www.scmp.com/rss/91/feed', limit: 12 },
+  eia:      { name: 'EIA', url: 'https://www.eia.gov/rss/todayinenergy.xml', limit: 8 },
+  oil:      { name: 'OilPrice', url: 'https://oilprice.com/rss/main', limit: 12 },
+  invest:   { name: 'Investing', url: 'https://www.investing.com/rss/news_1.rss', limit: 8 },
+  zh:       { name: 'ZeroHedge', url: 'https://feeds.feedburner.com/zerohedge/feed', limit: 12 },
+};
+const TOPIC_FEEDS = [
+  { re: /特朗普|川普|trump|关税|tariff|贸易战|白宫|制裁|sanction/i, ids: ['trump', 'wh', 'cnbc', 'bbcW'] },
+  { re: /美联储|fed|鲍威尔|沃什|加息|降息|利率|CPI|非农|通胀|美债|美元/i, ids: ['fed', 'fedSpeak', 'cnbc', 'wsj'] },
+  { re: /地缘|中东|伊朗|以色列|哈马斯|俄乌|俄罗斯|乌克兰|战争|停火|霍尔木兹|胡塞|台海/i, ids: ['aj', 'bbcW', 'toi', 'tass'] },
+  { re: /原油|油价|OPEC|能源|天然气/i, ids: ['oil', 'eia', 'zh'] },
+  { re: /黄金|白银|金价|银价|贵金属|金银/i, ids: ['oil', 'zh', 'invest', 'wsj'] },
+  { re: /A股|沪指|沪深|股市|港股|人民币/i, ids: ['scmp', 'bbcB', 'cnbc'] },
+  { re: /科技|芯片|AI|人工智能|苹果|英伟达|OpenAI|特斯拉|半导体/i, ids: ['cnbc', 'bbcB', 'zh'] },
+];
+const DEFAULT_FEEDS = ['cnbc', 'bbcW', 'zh'];
+// X（推特）：Nitter 中转 twiiit.com，免费无 key；但实例不稳（会 403），失败就静默跳过
+// 账号池：realDonaldTrump（特朗普）/ NickTimiraos（WSJ 美联储记者）/ DeItaone（快讯）/ FirstSquawk / zerohedge
+const feedCache = new Map();   // 同一次日报里多个主题会撞同一个源，缓存 2 分钟省流量
 // 乐哥要求：回复只给内容，不带网站链接（要链接就把 WXBOT_LINKS=true 写进 .secrets）
 const WITH_LINKS = String(env('WXBOT_LINKS', 'false')).toLowerCase() === 'true';
 // 自更新源：微信发「更新」→ 拉最新 index.js 覆盖自己 → 重启生效
@@ -229,11 +263,59 @@ async function fetchBing(q) {
     const url = unwrapBing(pickTag(b, 'link'));
     if (!title) continue;
     let source = '';
-    try { source = new URL(url).hostname.replace(/^www\./, ''); } catch {}
+    try { source = new URL(url).hostname.replace(/^www\./, ''); }
+    catch { source = (String(url).match(/^https?:\/\/([^/]+)/) || [])[1] || ''; }
+    if (/^https?:/i.test(source)) source = (source.match(/^https?:\/\/([^/]+)/) || [])[1] || source;
     items.push({ title, url, source: source || 'Bing', direct: true, time: pickTag(b, 'pubDate') ? new Date(pickTag(b, 'pubDate')).toISOString() : '' });
   }
   if (!items.length) log('WARN', `Bing 0 条（HTTP 200, ${xml.length}B，正文开头：${xml.replace(/\s+/g, ' ').slice(0, 160)}）`);
   return items;
+}
+// ── 通用 RSS/Atom 解析（全球源用；description/content 直接当正文，省一次网页抓取）──
+function parseFeed(xml, srcName, limit, descLimit) {
+  const items = []; const re = /<(item|entry)[\s>]([\s\S]*?)<\/\1>/g; let m;
+  while ((m = re.exec(xml)) && items.length < (limit || 12)) {
+    const b = m[2];
+    let title = deEnt(pickTag(b, 'title')).replace(/\s+/g, ' ').trim();
+    let link = pickTag(b, 'link') || (b.match(/<link[^>]+href=["']([^"']+)/i) || [])[1] || '';
+    const date = pickTag(b, 'pubDate') || pickTag(b, 'published') || pickTag(b, 'updated') || pickTag(b, 'dc:date');
+    const descRaw = pickTag(b, 'description') || pickTag(b, 'content:encoded') || pickTag(b, 'summary') || pickTag(b, 'content');
+    if (!title || title.length < 6) continue;
+    const body = stripTags(descRaw).replace(/\s+/g, ' ').slice(0, descLimit || 700);
+    items.push({ title, url: link, source: srcName, direct: false, body: body.length >= 80 ? body : '', time: date ? new Date(date).toISOString() : '' });
+  }
+  return items;
+}
+async function fetchFeed(spec) {
+  const hit = feedCache.get(spec.url);
+  if (hit && Date.now() - hit.at < 120000) return hit.items.slice();
+  const xml = await getText(spec.url, 14000);
+  const items = parseFeed(xml, spec.name, spec.limit, 800);
+  log('INFO', `feed ${spec.name} bytes=${xml.length} items=${items.length}`);
+  if (feedCache.size > 40) feedCache.clear();
+  feedCache.set(spec.url, { at: Date.now(), items });
+  return items.slice();
+}
+async function fetchX(user, limit) {
+  const xml = await getText('https://twiiit.com/' + encodeURIComponent(user) + '/rss', 15000);
+  const items = parseFeed(xml, 'X@' + user, limit || 12, 600);
+  if (!items.length) throw new Error('空（实例 403/限流）');
+  return items;
+}
+function topicFeedsFor(q) {
+  const ids = new Set();
+  for (const t of TOPIC_FEEDS) if (t.re.test(q)) for (const id of t.ids) ids.add(id);
+  if (!ids.size) for (const id of DEFAULT_FEEDS) ids.add(id);
+  return [...ids];
+}
+function xAccountsFor(q) {
+  const out = new Set();
+  if (/特朗普|川普|trump|关税|tariff|白宫|制裁|sanction/i.test(q)) out.add('realDonaldTrump');
+  if (/美联储|fed|鲍威尔|沃什|加息|降息|利率|CPI|非农|通胀|美债|美元/i.test(q)) out.add('NickTimiraos');
+  if (/黄金|白银|金价|银价|原油|油价|股市|A股|美股|OPEC|能源/i.test(q)) { out.add('DeItaone'); out.add('zerohedge'); }
+  if (/地缘|中东|伊朗|以色列|俄乌|俄罗斯|乌克兰|战争|停火|霍尔木兹/i.test(q)) out.add('zerohedge');
+  if (!out.size) { out.add('DeItaone'); out.add('zerohedge'); }
+  return [...out].slice(0, 2);      // 最多 2 个账号：twiiit 不稳且慢，够用就行
 }
 const normTitle = t => String(t).replace(/[\s\p{P}\p{S}]/gu, '').toLowerCase();
 function dedupeSort(all, keepHours) {
@@ -256,21 +338,44 @@ function dedupeSort(all, keepHours) {
 }
 async function searchNews(topic) {
   const q = String(topic || '').trim() || '最新 新闻';
-  // Bing 放最前：它的 link 是原始站点直链（已拆掉 apiclick 包装），国内手机不翻墙也能打开；
-  // Google News 覆盖更广但链接是 news.google.com 跳转页。GDELT 作补充（英文主题更有效）
-  const [b, g, d] = await Promise.all([
-    fetchBing(q).catch(e => { log('WARN', 'Bing fail=' + e.message); return []; }),
-    fetchGNews(q).catch(e => { log('WARN', 'GNews fail=' + e.message); return []; }),
-    fetchGdelt(q).catch(e => { log('WARN', 'GDELT fail=' + e.message); return []; }),
-  ]);
-  const direct = dedupeSort([...b, ...d], 72);          // 直链池（Bing/GDELT）
-  const merged = dedupeSort([...b, ...d, ...g], 72);    // 全网池（直链优先占位）
-  const out = []; const have = new Set();
-  const add = it => { if (out.length < MAX_ITEMS && !have.has(it.hash)) { have.add(it.hash); out.push(it); } };
-  for (const it of direct.slice(0, Math.min(direct.length, Math.max(3, Math.ceil(MAX_ITEMS / 2))))) add(it);
-  for (const it of merged) add(it);
+  // 源分三类并发：
+  //   ① 中文直链（Bing 拆包 / GDELT）—— 能抓网页正文，国内也能直接打开
+  //   ② 全球源（RSS：Truth Social / 白宫 / 美联储 / CNBC / BBC / 半岛 / TASS / OilPrice / EIA / ZeroHedge…）RSS 自带正文摘要
+  //   ③ Google News —— 覆盖最广但链接是跳转页，只用来补广度
+  const feedIds = topicFeedsFor(q), xs = xAccountsFor(q);
+  const tasks = [
+    ['bing', fetchBing(q)], ['gnews', fetchGNews(q)], ['gdelt', fetchGdelt(q)],
+    ...feedIds.map(id => [id, fetchFeed(FEEDS[id])]),
+    ...xs.map(u => ['x:' + u, fetchX(u)]),
+  ];
+  const settled = await Promise.allSettled(tasks.map(t => t[1]));
+  const bing = [], gnews = [], gdelt = [], feeds = [], xits = [];
+  tasks.forEach((t, i) => {
+    const r = settled[i];
+    if (r.status !== 'fulfilled') { log('WARN', `src ${t[0]} fail=${String((r.reason && r.reason.message) || r.reason).slice(0, 60)}`); return; }
+    const arr = r.value || [];
+    if (t[0] === 'bing') bing.push(...arr);
+    else if (t[0] === 'gnews') gnews.push(...arr);
+    else if (t[0] === 'gdelt') gdelt.push(...arr);
+    else if (t[0].startsWith('x:')) xits.push(...arr);
+    else feeds.push(...arr);
+  });
+  const zh = dedupeSort([...bing, ...gdelt], 72);
+  const gl = dedupeSort([...feeds, ...xits], 72);
+  const gn = dedupeSort(gnews, 72);
+  const out = []; const have = new Set(); const srcCount = new Map();
+  const add = it => {
+    if (out.length >= AI_ITEM_CAP || have.has(it.hash)) return;
+    const s = String(it.source || '');
+    if ((srcCount.get(s) || 0) >= 3) return;      // 同一个源最多占 3 个候选位，别被一家刷屏
+    have.add(it.hash); srcCount.set(s, (srcCount.get(s) || 0) + 1); out.push(it);
+  };
+  for (const it of zh.slice(0, 5)) add(it);      // 中文直链 5
+  for (const it of gl.slice(0, 6)) add(it);      // 全球源 6（RSS 自带正文）
+  for (const it of gn.slice(0, 4)) add(it);      // Google 补 3-4
+  for (const it of dedupeSort([...zh, ...gl, ...gn], 72)) add(it);
   out.sort((x, y) => (y.time || '').localeCompare(x.time || ''));
-  log('INFO', `search q=${q} bing=${b.length} gnews=${g.length} gdelt=${d.length} out=${out.length}`);
+  log('INFO', `search q=${q} bing=${bing.length} gnews=${gnews.length} gdelt=${gdelt.length} feeds=${feeds.length}[${feedIds.join(',')}] x=${xits.length} out=${out.length}`);
   return out;
 }
 
@@ -302,6 +407,8 @@ const listOf = (items, withUrl) => items.map((it, i) =>
   `${i + 1}. ${it.title || '(无标题)'}${it.source ? '（' + it.source + '）' : ''}${it.time ? ' ' + fmtCST(it.time) : ''}${withUrl && it.url ? '\n   ' + it.url : ''}`
 ).join('\n');
 const fmtScore = n => (n == null || !isFinite(n)) ? '' : (Number.isInteger(Number(n)) ? String(Number(n)) : Number(n).toFixed(1));
+// 有些源把整条 URL 塞进 <source> 标签（例如 ruibao.news）→ 显示前统一洗干净
+const cleanSource = s => { let t = String(s || '').trim(); const m = t.match(/^https?:\/\/([^/\s]+)/i); if (m) t = m[1]; return t.replace(/^www\./, '').slice(0, 26); };
 
 // ── ① 正文抓取（替代 trafilatura：去脚本样式 → 取正文段落，限 4 并发）──
 function looksLikeCode(t) {
@@ -385,8 +492,10 @@ const SCORE_SYS = `你是财经新闻编辑。当前北京时间：${nowCST()}�
 - 0-2 噪声：传闻、荐股或推广、没有解释的数字、耸动预测、没有可靠财经实质（例如把"黄金周旅游"当成金价新闻）
 【评估要点】看事件规模与影响面、来源质量、时效性、是否给出带基线的具体数字；区分已报道事实与预测、观点；不因涨幅大就加分（必须看基数）；不把热度当重要性。
 【摘要规范】每条一句话、最多 45 字：先说事件，再给最关键的数字或政策变化，保留货币、单位、时间区间与比较基准；公司说法、分析师预测、指控、提案都要标明来源；不确定的就别写，绝不编造；不要写"属重大事件""值得关注""影响深远"这类评价套话，直接给事实和数字。
+【影响】只在有直接、实质影响时写一句（谁受影响、通过什么机制，<=30 字）；没有就留空字符串。不要重复摘要、不要泛泛而谈。
+【去重】给每条一个 event：同一件事的短标识（4-10 字，例如"对俄关税豁免""美联储议息""iPhone发布""A股回购"）。多家媒体报同一件事必须用完全相同的 event 字符串。
 【输出格式】只输出一个 JSON 数组，不要解释、不要代码块、不要多余文字：
-[{"i":1,"score":8.5,"tags":["黄金","央行购金"],"summary":"一句话摘要"}]`;
+[{"i":1,"score":8.5,"event":"事件短标识","tags":["黄金","央行购金"],"summary":"一句话摘要","impact":"影响（没有就空字符串）"}]`;
 function parseJsonArray(s) {
   let t = String(s).replace(/```[a-z]*/gi, '').trim();
   const a = t.indexOf('['), b = t.lastIndexOf(']');
@@ -408,7 +517,10 @@ async function scoreItems(topic, items) {
     const o = byIdx.get(k + 1);
     const sc = o && isFinite(Number(o.score)) ? Number(o.score) : null;
     if (sc != null) hit++;
-    return { ...it, score: sc, tags: (o && Array.isArray(o.tags)) ? o.tags.slice(0, 5).map(String) : [], summary: (o && o.summary) ? String(o.summary).replace(/\s+/g, ' ').slice(0, 90) : '' };
+    return { ...it, score: sc, event: (o && o.event) ? String(o.event).replace(/\s+/g, '').slice(0, 14) : '',
+      tags: (o && Array.isArray(o.tags)) ? o.tags.slice(0, 5).map(String) : [],
+      summary: (o && o.summary) ? String(o.summary).replace(/\s+/g, ' ').slice(0, 90) : '',
+      impact: (o && o.impact) ? String(o.impact).replace(/\s+/g, ' ').slice(0, 70) : '' };
   });
   log('INFO', `scored ${hit}/${items.length}（原始输出 ${raw.length} 字）`);
   return scored;
@@ -421,19 +533,35 @@ function rankItems(items, keep) {
   return (good.length >= floor ? good : sorted.slice(0, floor)).slice(0, keep);
 }
 
-// 回复排版（乐哥要求：只给内容，不带网址）
+// 同一件事多家媒体报 → 每件事最多留 2 条（留不同视角），其余位置让给别的事
+function dedupeByEvent(items, keep) {
+  const cnt = new Map(); const out = [];
+  for (const it of items) {
+    const k = String(it.event || '');
+    if (k) { const c = cnt.get(k) || 0; if (c >= 2) continue; cnt.set(k, c + 1); }
+    out.push(it);
+    if (out.length >= keep) break;
+  }
+  if (out.length < Math.min(3, keep)) return items.slice(0, keep);   // 合并过头（全场就一件事）→ 回退按分数给
+  return out;
+}
+// 先按分数排（多给 4 条余量给"同事件合并"腾位置），再合并同事件、截到 keep
+function pickTop(items, keep) { return dedupeByEvent(rankItems(items, keep + 4), keep); }
+
+// 回复排版（乐哥要求：只给内容，不带网址；★ 后面是重要性评分，越高越重要）
 function renderItems(items) {
   return items.map((it, i) => {
     const sc = fmtScore(it.score);
-    const head = `${i + 1}. ${sc ? '[' + sc + '] ' : ''}${it.title || '(无标题)'}${it.source ? '（' + it.source + '）' : ''}${it.time ? ' ' + fmtCST(it.time) : ''}`;
-    const extra = it.summary ? '\n   ' + it.summary : (WITH_LINKS && it.url ? '\n   ' + it.url : '');
-    return head + extra + (WITH_LINKS && it.summary && it.url ? '\n   ' + it.url : '');
+    const head = `${i + 1}. ${sc ? '★' + sc + ' ' : ''}${it.title || '(无标题)'}${it.source ? '（' + cleanSource(it.source) + '）' : ''}${it.time ? ' ' + fmtCST(it.time) : ''}`;
+    const sum = it.summary ? '\n   ' + it.summary : (WITH_LINKS && it.url ? '\n   ' + it.url : '');
+    const imp = it.impact ? '\n   → 影响：' + it.impact : '';
+    return head + sum + imp + (WITH_LINKS && it.summary && it.url ? '\n   ' + it.url : '');
   }).join('\n');
 }
 function buildReply(titleLine, aiHead, items) {
   const lines = [titleLine];
   if (aiHead) lines.push('', aiHead);
-  lines.push('', WITH_LINKS ? '—— 原始条目 ——' : (items.some(x => x.summary) ? '—— 内容（按重要性）——' : '—— 标题 ——'), renderItems(items));
+  lines.push('', WITH_LINKS ? '—— 原始条目 ——' : (items.some(x => x.summary) ? '—— 精选（★ 越高越重要）——' : '—— 标题 ——'), renderItems(items));
   return lines.join('\n');
 }
 
@@ -447,22 +575,33 @@ async function answerNews(from, topic) {
   await enrichBodies(cands, BODY_BUDGET_NEWS, BODY_LIMIT_NEWS);      // 抓正文 → 摘要基于内容而不是标题
   let scored = [];
   try { scored = await scoreItems(topic, cands); } catch (e) { log('WARN', 'ai score fail ' + e.message); }
-  const ranked = rankItems(scored.length ? scored : cands, MAX_ITEMS);   // 按重要性排序 + 低分当噪声丢掉
+  const picked = pickTop(scored.length ? scored : cands, MAX_ITEMS);   // 按重要性排序 + 同事件合并 + 低分当噪声丢
   const gotBody = cands.filter(x => x.body).length;
-  const body = buildReply(`🔎 ${topic} · 近 3 天 · 抓到 ${items.length} 条 → 精选 ${ranked.length} 条`, '', ranked);
+  const body = buildReply(`🔎 ${topic} · 近 3 天 · 抓到 ${items.length} 条 → 精选 ${picked.length} 条`, '', picked);
   await sendChunks(from, body, ctxTokens[from]);
-  log('INFO', `news reply sent topic=${topic} picked=${ranked.length} scored=${scored.some(x => x.score != null) ? 'ok' : 'off'} bodies=${gotBody}`);
+  log('INFO', `news reply sent topic=${topic} picked=${picked.length} scored=${scored.some(x => x.score != null) ? 'ok' : 'off'} bodies=${gotBody}`);
 }
 
-const DAILY_TOPICS = ['黄金', '白银', '原油', '美联储', 'A股', '苹果', '科技'];
+// 日报主题：按乐哥的重点排 —— 特朗普/关税、美联储、地缘 优先，再贵金属/能源/股市/科技
+// kw 用于"标题是否沾主题"的排序加权（中英双语都要匹配）
+const DAILY_TOPICS = [
+  { q: '特朗普 关税', kw: ['特朗普', '川普', 'Trump', 'tariff', '关税'] },
+  { q: '美联储 利率', kw: ['美联储', '沃什', '鲍威尔', 'Fed', 'Warsh', 'Powell', 'CPI'] },
+  { q: '中东 局势', kw: ['伊朗', '以色列', '中东', 'Iran', 'Israel', 'Gaza', '霍尔木兹'] },
+  { q: '黄金', kw: ['黄金', '金价', 'gold'] },
+  { q: '白银', kw: ['白银', '银价', 'silver'] },
+  { q: '原油', kw: ['原油', '油价', 'OPEC', 'oil', 'crude'] },
+  { q: 'A股', kw: ['A股', '沪指', '沪深', '股市'] },
+  { q: 'AI 芯片', kw: ['AI', '芯片', '英伟达', 'OpenAI', 'Nvidia', '半导体'] },
+];
 const JUNK_TITLE = /(调研|座谈|股东户数|户均持|读懂了|讨论区|招聘|免责声明|活动预告)/;
 let dailyRunning = false;
 async function collectDaily() {
   const all = [];
   for (let i = 0; i < DAILY_TOPICS.length; i += 3) {          // 分批 3 个主题并发，400MB 容器也稳
     const batch = DAILY_TOPICS.slice(i, i + 3);
-    const res = await Promise.all(batch.map(t => searchNews(t).catch(() => [])));
-    batch.forEach((t, k) => { for (const it of res[k]) all.push({ ...it, topic: t }); });
+    const res = await Promise.all(batch.map(t => searchNews(t.q).catch(() => [])));
+    batch.forEach((t, k) => { for (const it of res[k]) all.push({ ...it, topic: t.kw }); });
   }
   return (() => {
     const pool = dedupeSort(selectBalanced(all), 72);
@@ -480,10 +619,14 @@ function selectBalanced(all) {
   const byTopic = new Map();
   for (const it of src) { const a = byTopic.get(it.topic) || []; a.push(it); byTopic.set(it.topic, a); }
   const pool = [];
-  for (const [t, arr] of byTopic) {
-    // 直链优先（Bing/GDELT 能抓正文 → 摘要基于内容），同级再按时间新→旧；Google 跳转页补位
+  for (const [kw, arr] of byTopic) {
+    const kws = Array.isArray(kw) ? kw : [kw];
+    // 直链优先（能抓正文 → 摘要基于内容），同级再按时间新→旧；Google 跳转页补位
     arr.sort((x, y) => ((y.direct ? 1 : 0) - (x.direct ? 1 : 0)) || (y.time || '').localeCompare(x.time || ''));
-    const hit = arr.filter(it => String(it.title).includes(t));
+    const hit = arr.filter(it => {
+      const s = (String(it.title) + ' ' + String(it.source)).toLowerCase();
+      return kws.some(k => s.includes(String(k).toLowerCase()));
+    });
     pool.push(...(hit.length >= 2 ? hit.slice(0, 4) : arr.slice(0, 4)));
   }
   return pool;
@@ -497,7 +640,7 @@ async function answerDaily(from) {
     if (!top.length) { await sendText(from, '乐哥 今天几个源都没返回内容（可能网络受限），稍后再试。', ctxTokens[from]); return; }
     await enrichBodies(top, BODY_BUDGET_DAILY, BODY_LIMIT_DAILY);
     let ranked = top;
-    try { ranked = rankItems(await scoreItems('今日要闻', top), DAILY_MAX); } catch (e) { log('WARN', 'daily score fail ' + e.message); }
+    try { ranked = pickTop(await scoreItems('今日要闻', top), DAILY_MAX); } catch (e) { log('WARN', 'daily score fail ' + e.message); }
     let head = '';
     try {
       head = await agnes([
@@ -531,11 +674,12 @@ function extractTopic(t) {
 }
 const HELP = `乐哥 我在这儿，用法就三条：
 
-1. 直接问新闻 —— 例如「黄金」「苹果折叠屏最新消息」「伊朗局势」。我实时搜 3 个源、抓正文、按重要性评分排序，每条给您一句内容摘要（不编、不给链接）。
-2. 发「日报」—— 7 个主题（金/银/油/美联储/A股/苹果/科技）汇总 15 条要闻，约 1-2 分钟。
+1. 直接问新闻 —— 「黄金」「特朗普关税」「美联储」「伊朗局势」「英伟达」，我并发搜三类源（中文直链 + 全球一手源 + Google），抓正文，按重要性打分（★，10 分满分），每条给您一句摘要 + 影响。
+2. 发「日报」—— 8 个重点：特朗普关税 / 美联储 / 中东局势 / 黄金 / 白银 / 原油 / A股 / AI芯片，约 1-2 分钟。
 3. 随便聊 —— 问别的也行。
 
-发「更新」= 让我升级到最新版（不用您再传文件）。
+发「更新」= 升级到最新版（不用您再传文件）。
+全球一手源：Truth Social（特朗普原帖）、白宫行政令、美联储（新闻+讲话）、CNBC、WSJ、BBC、半岛电视台、Times of Israel、TASS、SCMP、OilPrice、EIA、Investing、ZeroHedge、X/Twitter。
 评分标准来自您本机 ThysraelHorizon 技能的 finance-news 档案（9-10 系统性 … 0-2 噪声）。`;
 
 const chatHistFile = path.join(STATE_DIR, ACCOUNT_ID + '.chat.json');
@@ -697,7 +841,7 @@ process.on('unhandledRejection', e => log('ERROR', 'unhandledRejection ' + (e &&
     await enrichBodies(cands, BODY_BUDGET_NEWS, BODY_LIMIT_NEWS);
     let scored = [];
     try { scored = await scoreItems(topic, cands); } catch (e) { log('WARN', 'ai fail ' + e.message); }
-    const ranked = rankItems(scored.length ? scored : cands, MAX_ITEMS);
+    const ranked = pickTop(scored.length ? scored : cands, MAX_ITEMS);
     const body = buildReply(`🔎 ${topic} · 近 3 天 · 抓到 ${items.length} 条 → 精选 ${ranked.length} 条`, '', ranked);
     console.log(`----- 微信原文（${body.length} 字 / 用时 ${((Date.now() - t0) / 1000).toFixed(1)}s / rss ${process.memoryUsage().rss / 1048576 | 0}MB / 抓到正文 ${cands.filter(x => x.body).length} 条 / 会分成 ${Math.ceil(body.length / SPLIT_THRESHOLD)} 条）-----`);
     console.log(body);
@@ -708,7 +852,7 @@ process.on('unhandledRejection', e => log('ERROR', 'unhandledRejection ' + (e &&
     const top = await collectDaily();
     await enrichBodies(top, BODY_BUDGET_DAILY, BODY_LIMIT_DAILY);
     let ranked = top;
-    try { ranked = rankItems(await scoreItems('今日要闻', top), DAILY_MAX); } catch (e) { log('WARN', 'daily score fail ' + e.message); }
+    try { ranked = pickTop(await scoreItems('今日要闻', top), DAILY_MAX); } catch (e) { log('WARN', 'daily score fail ' + e.message); }
     const body = buildReply(`📰 今日要闻 · ${nowCST().slice(0, 10)} · 精选 ${ranked.length} 条`, '', ranked);
     console.log(`[selftest] daily items=${ranked.length} 用时=${((Date.now() - t0) / 1000).toFixed(1)}s rss=${process.memoryUsage().rss / 1048576 | 0}MB 正文=${top.filter(x => x.body).length} 条`);
     console.log(`----- 日报微信原文（${body.length} 字 / 会分成 ${Math.ceil(body.length / SPLIT_THRESHOLD)} 条）-----`);
