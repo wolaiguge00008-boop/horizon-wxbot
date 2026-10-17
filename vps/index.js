@@ -82,6 +82,7 @@ const DEFAULT_FEEDS = ['cnbc', 'bbcW', 'zh'];
 // X（推特）：Nitter 中转 twiiit.com，免费无 key；但实例不稳（会 403），失败就静默跳过
 // 账号池：realDonaldTrump（特朗普）/ NickTimiraos（WSJ 美联储记者）/ DeItaone（快讯）/ FirstSquawk / zerohedge
 const feedCache = new Map();   // 同一次日报里多个主题会撞同一个源，缓存 2 分钟省流量
+setInterval(() => { feedCache.clear(); }, 10 * 60 * 1000).unref();   // 双保险：10 分钟全清一次（内存里也就几十 KB）
 // 乐哥要求：回复只给内容，不带网站链接（要链接就把 WXBOT_LINKS=true 写进 .secrets）
 const WITH_LINKS = String(env('WXBOT_LINKS', 'false')).toLowerCase() === 'true';
 // 自更新源：微信发「更新」→ 拉最新 index.js 覆盖自己 → 重启生效
@@ -93,6 +94,32 @@ const HONOR = '用户是"乐哥"，你每次回复必须以"乐哥 "（带空格
 fs.mkdirSync(STATE_DIR, { recursive: true });
 try { fs.chmodSync(SECRETS_FILE, 0o600); } catch {}
 const log = (lvl, m) => console.log(`[${new Date().toISOString()}] ${lvl} ${m}`);
+
+// ── 启动自清理（容器磁盘只有 1.5GB，绝不允许攒垃圾）──
+// ① 中断写剩的临时文件（.tmp123 / .new456）→ 删；② 已废弃的 Horizon 安装残留 → 删；③ 把 state 目录体积打日志，随时可查
+function housekeeping() {
+  const cutoff = Date.now() - 60000, killed = [];
+  for (const dir of [STATE_DIR, path.dirname(__filename)]) {
+    let names = []; try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names) {
+      const full = path.join(dir, n);
+      try {
+        const st = fs.statSync(full); if (!st.isFile()) continue;
+        if (/\.(tmp|new)\d+$/.test(n) && st.mtimeMs < cutoff) { fs.unlinkSync(full); killed.push(n); continue; }
+        if (/^horizon-setup\.(sh|attempts)$/.test(n)) { fs.unlinkSync(full); killed.push(n); continue; }
+      } catch {}
+    }
+  }
+  if (killed.length) log('INFO', `housekeeping 清理 ${killed.length} 个残留: ${killed.join(', ')}`);
+  try {
+    let total = 0; const list = [];
+    for (const n of fs.readdirSync(STATE_DIR)) {
+      const st = fs.statSync(path.join(STATE_DIR, n));
+      if (st.isFile()) { total += st.size; list.push(`${n}=${(st.size / 1024).toFixed(1)}KB`); }
+    }
+    log('INFO', `state 目录: ${list.join(' ') || '空'}（合计 ${(total / 1024).toFixed(1)}KB）`);
+  } catch {}
+}
 
 let TOKEN = env('WEIXIN_TOKEN', '');
 const syncBufFile = path.join(STATE_DIR, ACCOUNT_ID + '.sync.json');
@@ -694,6 +721,8 @@ async function chatReply(userText, from) {
     const h = chatHist[from] = (chatHist[from] || []);
     h.push({ role: 'user', content: userText }, { role: 'assistant', content });
     if (h.length > 12) chatHist[from] = h.slice(-12);
+    const ks = Object.keys(chatHist);                       // 只保留最近 20 个联系人，防止文件无限长大
+    if (ks.length > 20) { const nc = {}; for (const k of ks.slice(-20)) nc[k] = chatHist[k]; chatHist = nc; }
     saveJson(chatHistFile, chatHist);
   }
   return content;
@@ -821,6 +850,7 @@ process.on('unhandledRejection', e => log('ERROR', 'unhandledRejection ' + (e &&
 
 (async () => {
   const mode = process.argv[2] || 'poll';
+  housekeeping();                 // 每次启动先清残留（临时文件 / Horizon 旧安装），再打一行 state 体积
   if (mode === '--selftest') {   // 本机自检：不碰 iLink，只验证"搜索+AI"链路
     const topic = process.argv[3] || '黄金';
     const items = await searchNews(topic);
